@@ -9,13 +9,27 @@
 # 3. run: Interactive mode to detect outbound connections and run diagnostics.
 # ==============================================================================
 
-# Default log file. This can be overridden by user prompts. Override for non App Service Environments (VMs, ACAs etc).
-LOG_FILE="/home/Logfiles/nwutils.log"
-PACKET_CAPTURE_FILE="/home/Logfiles/nwutils_$(date +%s).pcap"
-if ! touch "$LOG_FILE" 2>/dev/null; then
-    LOG_FILE="/home/Logfiles/nwutils.log"
-    touch "$LOG_FILE"
+# Default log dir - applicable for Azure Linux App Services
+LOG_DIR="/home/Logfiles"
+
+# Create a custom log dir (/Appuserlogs) in IaaS or non App Service hosts
+if [ ! -d "$LOG_DIR" ]; then
+    LOG_DIR="/Appuserlogs"
+    mkdir -p "$LOG_DIR" || {
+        echo "Failed to create log directory"
+        exit 1
+    }
 fi
+
+# Create Log files
+LOG_FILE="$LOG_DIR/nwutils.log"
+PACKET_CAPTURE_FILE="$LOG_DIR/nwutils_$(date +%s).pcap"
+
+# Test access
+touch "$LOG_FILE" || {
+    echo "Cannot write to log file"
+    exit 1
+}
 
 # Log messages to both stdout and log file
 log_message() {
@@ -26,31 +40,35 @@ log_message() {
 
 log_message "Log file initialized at $LOG_FILE"
 
-# Check if the script is run as root
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        return 1 # Not root
-    else
-        return 0 # Is root
+# Check if the script is run as root else attempt to run with sudo
+root_or_try() {
+    if [ "$EUID" -eq 0 ]; then
+        return 0
     fi
+
+    if command -v sudo >/dev/null 2>&1; then
+        log_message "Not running as root. Attempting to re-run with sudo..."
+        sudo "$0" "$@" || {
+            log_message "sudo attempt failed or was canceled by user."
+            exit 1
+        }
+        exit 0
+    else
+        log_message "Error: sudo not available and script is not running as root."
+        exit 1
+    fi
+}
+
+# Port validation helper function
+validate_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
 # INSTALLATION
 # Detects OS and installs networking tools
 install_tools() {
-    if ! check_root; then
-        log_message "Tool installation requires root privileges. Please run with sudo."
-        # Attempt to re-run with sudo
-        if command -v sudo &> /dev/null; then
-            log_message "Attempting to re-run with sudo..."
-            sudo "$0" "install"
-            exit $?
-        else
-            log_message "sudo command not found. Please run this script as root."
-            exit 1
-        fi
-    fi
-
+    root_or_try install
     log_message "*** Starting Tool Installation ***"
 
     # Detect OS
@@ -70,12 +88,14 @@ install_tools() {
     local UPDATE_CMD=""
     local packages_to_install=""
 
+check_tools "nmap" "nping" "hping3" "ss"
+
     case "$OS_ID" in
         ubuntu|debian)
             PKG_MANAGER="apt-get"
             UPDATE_CMD="apt-get update"
             INSTALL_CMD="apt-get install -y"
-            packages_to_install="nmap netcat-openbsd tcpdump dnsutils iftop net-tools netsniff-ng iptraf-ng curl wget lsof"
+            packages_to_install="nmap netcat-openbsd tcpdump dnsutils iproute2 iftop net-tools iptraf-ng curl wget lsof"
             ;;
         rhel|mariner|azurelinux) # Red Hat, CBL-Mariner, Azure Linux
             PKG_MANAGER="dnf"
@@ -85,13 +105,13 @@ install_tools() {
             UPDATE_CMD="$PKG_MANAGER makecache"
             INSTALL_CMD="$PKG_MANAGER install -y"
             # nmap-ncat provides 'nc', bind-utils provides 'nslookup'
-            packages_to_install="nmap nmap-ncat tcpdump iproute bind-utils iftop net-tools netsniff-ng iptraf-ng curl wget lsof"
+            packages_to_install="nmap nmap-ncat tcpdump iproute bind-utils iftop net-tools iptraf-ng curl wget lsof"
             ;;
         alpine)
             PKG_MANAGER="apk"
             UPDATE_CMD="apk update"
             INSTALL_CMD="apk add"
-            packages_to_install="nmap nmap-ncat tcpdump iproute2 bind-tools iftop net-tools netsniff-ng iptraf-ng curl wget lsof"
+            packages_to_install="nmap nmap-ncat tcpdump iproute2 bind-tools iftop net-tools nethogs curl wget lsof"
             ;;
         *)
             log_message "Unsupported Operating System: $OS_ID. Cannot install tools."
@@ -110,7 +130,7 @@ install_tools() {
             log_message "Skip install for $pkg: Package not found or failed to install."
         fi
     done
-    log_message "--- Tool Installation Complete ---"
+    log_message "*** Tool Installation Complete ***"
 }
 
 # Checks if required tools are present and prompts for install if not.
@@ -195,8 +215,8 @@ run_interactive() {
     read -p "Please enter the destination Port to test: " target_port
 
     # Validate port
-    if ! [[ "$target_port" =~ ^[0-9]+$ ]] || [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
-        log_message "Error: Invalid port specified: '$target_port'. Must be 1-65535."
+    if ! validate_port "$target_port"; then
+        log_message "Error: Invalid port specified: '$target_port'. Must be an integer between 1-65535."
         exit 1
     fi
 
@@ -214,7 +234,7 @@ run_interactive() {
     process_info=$(echo "$connection" | awk '{print $7}' | head -n1)  
     process_name=$(echo "$process_info" | cut -d'/' -f2)
 
-    read -p "Detected application process: $process_name, destination: $dest_ip:$dest_port. Proceed with diagnostics? (y/n): " confirm
+    read -p "Detected application process: $process_name, destination: $target_ip:$target_port. Proceed with diagnostics? (y/n): " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         log_message "Diagnostics canceled by user."
         echo "Please run diagnostics manually if needed."
@@ -246,18 +266,16 @@ run_interactive() {
     
     local capture_cmd="tcpdump -i any -w $PACKET_CAPTURE_FILE host $target_ip and port $target_port -G 60 -W 1"
     
-    if ! check_root; then
-        if command -v sudo &> /dev/null; then
-            log_message "Requesting sudo for tcpdump..."
-            sudo $capture_cmd
-        else
-            log_message "Error: sudo not found. Cannot run tcpdump as non-root."
+    if [ "$EUID" -ne 0 ]; then
+        log_message "Packet capture requires root. Attempting sudo..."
+        sudo $capture_cmd || {
+            log_message "tcpdump sudo attempt failed."
             return 1
-        fi
+        }
     else
-        log_message "Running tcpdump as root..."
         $capture_cmd
     fi
+
     
     log_message "Packet capture complete. File: $PACKET_CAPTURE_FILE"
     log_message "--- Interactive Diagnostics Complete ---"
@@ -326,12 +344,6 @@ esac
 # --- Handle FQDN/IP commands ---
 # If not above (isntall, run, help), the cmdline arguments must be fqdn/ip and/or port number
 
-log_message() {
-    local message="$1"
-    local timestamped_message="[$(date +'%Y-%m-%d %H:%M:%S')] $message"
-    echo -e "$timestamped_message" | tee -a "$LOG_FILE"
-}
-
 log_message "--- Logging all diagnostics to $LOG_FILE ---"
 
 TARGET_FQDN="$1"
@@ -340,7 +352,7 @@ if [ "$#" -eq 1 ]; then
     test_connectivity "$TARGET_FQDN" "80" "443"
 elif [ "$#" -eq 2 ]; then
     TARGET_PORT="$2"
-    if ! [[ "$TARGET_PORT" =~ ^[0-9]+$ ]] || [ "$TARGET_PORT" -lt 1 ] || [ "$TARGET_PORT" -gt 65535 ]; then
+    if ! validate_port "$TARGET_PORT"; then
         log_message "Error: Invalid port specified: '$TARGET_PORT'. Must be a number between 1 and 65535."
         exit 1
     fi
