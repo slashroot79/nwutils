@@ -39,6 +39,8 @@ log_message() {
 }
 
 log_message "Log file initialized at $LOG_FILE"
+log_message "Logging all diagnostics to $LOG_FILE"
+log_message "=========================================================="
 
 # Check if the script is run as root else attempt to run with sudo
 root_or_try() {
@@ -65,6 +67,20 @@ validate_port() {
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
+# Host validation helper function
+validate_host() {
+    local host="$1"
+    # IPv4
+    if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 0
+    fi
+    # FQDN 
+    if [[ "$host" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # INSTALLATION
 # Detects OS and installs networking tools
 install_tools() {
@@ -88,8 +104,6 @@ install_tools() {
     local UPDATE_CMD=""
     local packages_to_install=""
 
-check_tools "nmap" "nping" "hping3" "ss"
-
     case "$OS_ID" in
         ubuntu|debian)
             PKG_MANAGER="apt-get"
@@ -111,7 +125,7 @@ check_tools "nmap" "nping" "hping3" "ss"
             PKG_MANAGER="apk"
             UPDATE_CMD="apk update"
             INSTALL_CMD="apk add"
-            packages_to_install="nmap nmap-ncat tcpdump iproute2 bind-tools iftop net-tools nethogs curl wget lsof"
+            packages_to_install="nmap nmap-ncat tcpdump iproute2 bind-tools iftop net-tools curl wget lsof"
             ;;
         *)
             log_message "Unsupported Operating System: $OS_ID. Cannot install tools."
@@ -131,6 +145,7 @@ check_tools "nmap" "nping" "hping3" "ss"
         fi
     done
     log_message "*** Tool Installation Complete ***"
+    log_message "=========================================================="
 }
 
 # Checks if required tools are present and prompts for install if not.
@@ -225,7 +240,7 @@ run_interactive() {
     connection=$(netstat -tunp 2>/dev/null | grep -v '127.0.0.1' | grep -v '::1' | grep -v ':22 ' | grep ":$target_port ")
 
     if [ -z "$connection" ]; then
-        log_message "No active outbound connection found for port $target_port."
+        log_message "No ACTIVE outbound connection found for port $target_port. If possible, trigger outbound n/w transactions and try again."
         exit 0
     fi
 
@@ -234,7 +249,7 @@ run_interactive() {
     process_info=$(echo "$connection" | awk '{print $7}' | head -n1)  
     process_name=$(echo "$process_info" | cut -d'/' -f2)
 
-    read -p "Detected application process: $process_name, destination: $target_ip:$target_port. Proceed with diagnostics? (y/n): " confirm
+    read -p "Detected application process: $process_name , destination: $target_ip:$target_port. Proceed with diagnostics? (y/n): " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         log_message "Diagnostics canceled by user."
         echo "Please run diagnostics manually if needed."
@@ -344,10 +359,11 @@ esac
 # --- Handle FQDN/IP commands ---
 # If not above (isntall, run, help), the cmdline arguments must be fqdn/ip and/or port number
 
-log_message "--- Logging all diagnostics to $LOG_FILE ---"
-
 TARGET_FQDN="$1"
-
+if ! validate_host "$TARGET_FQDN"; then
+    log_message "Error: Invalid hostname or IP: '$TARGET_FQDN'"
+    exit 1
+fi
 if [ "$#" -eq 1 ]; then
     test_connectivity "$TARGET_FQDN" "80" "443"
 elif [ "$#" -eq 2 ]; then
