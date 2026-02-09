@@ -82,7 +82,6 @@ validate_host() {
 # Detects OS and installs networking tools
 install_tools() {
     root_or_try install
-    log_message "**********************************************************"
     log_message "*** Starting Tool Installation ***"
     log_message "**********************************************************"
 
@@ -167,7 +166,7 @@ check_tools() {
             exit 1
         fi
     else
-        log_message "Found needed tools to proceed..."
+        log_message "Troubleshooting tools found...skipping installation..."
     fi
 }
 
@@ -179,33 +178,36 @@ run_diagnostics() {
     log_message "Proceeding with diagnostics for $target_ip:$target_port..."
 
     # --- 1. DNS resolution ---
+    log_message ""
     log_message "DNS lookup (nslookup)"
     if ! nslookup "$target_ip" 2>&1 | sed 's/^/  [dns] /' | tee -a "$LOG_FILE"; then
         log_message "  [dns] did not succeed or try manually if reverse lookup"
     fi
     wait
-    log_message "---"
+    log_message "----------------------------------------------------------"
 
     # --- 2. Network Reachability: nc ---
+    log_message ""
     log_message "Reachability test (nc)"
     if nc -z -w 3 "$target_ip" "$target_port" >/dev/null 2>&1; then
-        log_message "  [nc] Upstream dst reachable"
+        log_message "  [nc] Success...destination is reachable"
         nc_rc=0
     else
         log_message "  [nc] Upstream dst NOT reachable. Validate port and IP, try a different destination or a public endpoint and with a different (installed) tool (tcpping, nping)"
         nc_rc=1
     fi
     wait
-    log_message "---"
+    log_message "----------------------------------------------------------"
 
     # --- 3. Network Connectivity + latency: nping ---
-    log_message "Connectivity & latency test (nping --tcp-connect)"
+    log_message ""
+    log_message " \\n Connectivity & latency test (nping --tcp-connect)"
     if ! command -v nping >/dev/null 2>&1; then
         log_message "  [nping] not available on this system"
     else
         output="$(nping --tcp-connect -p "$target_port" -c 5 "$target_ip" 2>&1)"
 
-        if echo "$output" | grep -q "TCP connection succeeded"; then
+        if echo "$output" | grep -iq "succeeded"; then
             echo "$output" | awk '/RTT/ {print "  [nping]", $0}' | tee -a "$LOG_FILE"
         else
             log_message "  [nping] Connection attempt failed"
@@ -213,11 +215,11 @@ run_diagnostics() {
         fi
     fi
     wait
-    log_message "---"
+    log_message "----------------------------------------------------------"
 
     # --- 4. Packet capture (120s) - pcap + live diagnostics ---
-    log_message "Packet capture (120s)"
-    log_message "Capturing TCP + DNS traffic"
+    log_message ""
+    log_message "Packet capture (120s)...capturing TCP + DNS traffic and generating pcap files..."
 
     local pcap_file="$PACKET_CAPTURE_FILE"
     local filter="(host $target_ip and port $target_port) or port 53"
@@ -237,38 +239,26 @@ run_diagnostics() {
 
     wait
     log_message "Packet capture saved to $pcap_file"
-    log_message "---"
+    log_message "----------------------------------------------------------"
 
+# --- 5. TCP Stream Summary using tshark ---
+if command -v tshark >/dev/null 2>&1; then
+    log_message ""
+    log_message "Generating TCP stream summary (SYN, SYN-ACK, retransmissions, RTT, SYN_DROP)..."
 
- # --- 4. Packet capture for 120s ---
-    log_message "Packet capture (120s) - TCP + DNS traffic"
-    local pcap_file="$PACKET_CAPTURE_FILE"
-    local filter="(host $target_ip and port $target_port) or port 53"
+    # Ensure tshark can parse TCP
+    tshark -r "$pcap_file" -q -z conv,tcp >/dev/null 2>&1
 
-    if [ "$EUID" -ne 0 ]; then
-        log_message "Using sudo for tcpdump"
-        sudo timeout 120 tcpdump -i any -tttt -nn "$filter" | sed 's/^/  [tcpdump] /' | tee -a "$LOG_FILE" &
-        sudo timeout 120 tcpdump -i any -tttt -nn -w "$pcap_file" "$filter" >/dev/null 2>&1
-    else
-        timeout 120 tcpdump -i any -tttt -nn "$filter" | sed 's/^/  [tcpdump] /' | tee -a "$LOG_FILE" &
-        timeout 120 tcpdump -i any -tttt -nn -w "$pcap_file" "$filter" >/dev/null 2>&1
-    fi
-    wait
-    log_message "Packet capture saved to $pcap_file"
-    log_message "---"
+    # Get all TCP streams
+    STREAMS=$(tshark -r "$pcap_file" -T fields -e tcp.stream | sort -n | uniq)
+    for stream in $STREAMS; do
+        echo "stream $stream:" | tee -a "$LOG_FILE"
 
-    # --- 5. TCP Stream Summary using tshark ---
-    if command -v tshark >/dev/null 2>&1; then
-        log_message "Generating TCP stream summary (SYN, SYN-ACK, retransmissions, RTT, SYN_DROP)..."
-        tshark -r "$pcap_file" -q -z conv,tcp >/dev/null 2>&1 # ensures tshark can parse TCP
-        bash <<'EOF'
-STREAMS=$(tshark -r "$pcap_file" -T fields -e tcp.stream | sort -n | uniq)
-for stream in $STREAMS; do
-    echo "stream $stream:"
-    tshark -r "$pcap_file" -Y "tcp.stream==$stream" -T fields \
-        -e frame.time_relative \
-        -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport \
-        -e tcp.flags -e tcp.seq -e tcp.ack -e tcp.analysis.retransmission \
+        # Print each packet in the stream
+        tshark -r "$pcap_file" -Y "tcp.stream==$stream" -T fields \
+            -e frame.time_relative \
+            -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport \
+            -e tcp.flags -e tcp.seq -e tcp.ack -e tcp.analysis.retransmission \
         | while read -r time src sport dst dport flags seq ack retrans; do
             FLAG_STR=""
             [[ $flags =~ 0x02 ]] && FLAG_STR+="SYN "
@@ -276,23 +266,27 @@ for stream in $STREAMS; do
             [[ $flags =~ 0x10 ]] && FLAG_STR+="ACK "
             [[ $flags =~ 0x04 ]] && FLAG_STR+="RST "
             [[ -n $retrans ]] && FLAG_STR+="# retransmission"
-            echo "  $src:$sport -> $dst:$dport $FLAG_STR seq=$seq ack=$ack time=${time}s"
+            echo "  $src:$sport -> $dst:$dport $FLAG_STR seq=$seq ack=$ack time=${time}s" | tee -a "$LOG_FILE"
         done
-    SYN_TIME=$(tshark -r "$pcap_file" -Y "tcp.stream==$stream and tcp.flags.syn==1 and tcp.flags.ack==0" -T fields -e frame.time_relative | head -1)
-    SYNACK_TIME=$(tshark -r "$pcap_file" -Y "tcp.stream==$stream and tcp.flags.syn==1 and tcp.flags.ack==1" -T fields -e frame.time_relative | head -1)
-    if [[ -z $SYNACK_TIME && -n $SYN_TIME ]]; then
-        echo "  # no reply → SYN_DROP"
-    elif [[ -n $SYN_TIME && -n $SYNACK_TIME ]]; then
-        RTT=$(echo "($SYNACK_TIME - $SYN_TIME)*1000" | bc -l)
-        printf "  # SYN → SYN-ACK RTT: %.2f ms\n" "$RTT"
-    fi
-    echo ""
-done
-EOF
-    else
-        log_message "tshark not available. Skipping TCP stream summary. Review pcap with tcpdump or wireshark."
-    fi
-    log_message "---"
+
+        # Calculate SYN → SYN-ACK RTT
+        SYN_TIME=$(tshark -r "$pcap_file" -Y "tcp.stream==$stream and tcp.flags.syn==1 and tcp.flags.ack==0" -T fields -e frame.time_relative | head -1)
+        SYNACK_TIME=$(tshark -r "$pcap_file" -Y "tcp.stream==$stream and tcp.flags.syn==1 and tcp.flags.ack==1" -T fields -e frame.time_relative | head -1)
+
+        if [[ -z $SYNACK_TIME && -n $SYN_TIME ]]; then
+            echo "  # no reply → SYN_DROP" | tee -a "$LOG_FILE"
+        elif [[ -n $SYN_TIME && -n $SYNACK_TIME ]]; then
+            RTT=$(echo "($SYNACK_TIME - $SYN_TIME)*1000" | bc -l)
+            printf "  # SYN → SYN-ACK RTT: %.2f ms\n" "$RTT" | tee -a "$LOG_FILE"
+        fi
+
+        echo "" | tee -a "$LOG_FILE"
+    done
+else
+    log_message "tshark not available. Skipping TCP stream summary. Review pcap with tcpdump or Wireshark."
+fi
+
+    log_message "----------------------------------------------------------"
     log_message "Diagnostics finished for $target_ip:$target_port"
 }
 
@@ -304,8 +298,7 @@ test_connectivity() {
     # Create an array of ports from the rest of the arguments
     local ports=("${@:2}")
 
-    log_message "**********************************************************"
-    log_message "*** Starting Connectivity Test for $target on port(s): ${ports[*]} ***"
+    log_message "*** Starting tests for $target on port(s): ${ports[*]} ***"
     log_message "**********************************************************"
     
     # Check for required tools
@@ -319,8 +312,7 @@ test_connectivity() {
 
 # RUN 
 run_interactive() {
-    log_message "**********************************************************"
-    log_message "*** Starting Interactive Diagnostics Mode ***"
+    log_message "*** Starting tests in Interactive Mode ***"
     log_message "**********************************************************"
     check_tools "nmap" "iftop" "netstat"
 
@@ -357,8 +349,6 @@ run_interactive() {
         echo "Run diagnostics manually as needed. Ex: nwutils <fqdn> <port>. See nwutils -h for more options."
         exit 0
     fi
-
-    log_message "Proceeding with diagnostics..."
     run_diagnostics "$target_ip" "$target_port"
     log_message "**********************************************************"
 }
