@@ -20,10 +20,10 @@ Bash script for network troubleshooting and diagnostics on Linux environments, i
 
 ## Usage modes
 
-- **install** Detects OS type and level and install tools
-- **run** Runs in interactive mode and prompts for destination port number and proceeds with all diagnostics and generates logs and trace files.  
-- **<FQDN> and optionally <port>** Similar to interactive mode but for the specified destination IP and Port. 
-- **help or no args** Help and more options
+- **nwutils install :** Detects OS type and level and install tools
+- **nwutils run :** Runs in interactive mode and prompts for destination port number and proceeds with all diagnostics and generates logs and trace files.  
+- **nwutils <FQDN> and optionally <port> :** Similar to interactive mode but for the specified destination IP and Port. 
+- **nwutil help or no args :** Help and more options
 
 ---
 
@@ -41,4 +41,4 @@ Bash script for network troubleshooting and diagnostics on Linux environments, i
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/slashroot79/nwutils/refs/heads/master/nwutils_install.sh | bash
-chmod +x nwutils.sh
+
