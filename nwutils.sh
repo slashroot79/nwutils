@@ -2,12 +2,14 @@
 
 # ==============================================================================
 # Basic Network Diagnostics Script for Azure Linux Envionments
-# Author: Ragu Karuturi
+# Author: Ragu Karuturi 
 # This script provides multiple functions for network troubleshooting:
 # 1. install: Installs a suite of networking tools based on the detected OS.
 # 2. <target> [port]: Tests connectivity to a target FQDN or IP. Default ports 80 and 443.
 # 3. run: Interactive mode to detect outbound connections and run diagnostics.
 # ==============================================================================
+
+SCRIPT_VERSION="1.2.7"
 
 # Default log dir - applicable for Azure Linux App Services
 LOG_DIR="/home/Logfiles"
@@ -36,6 +38,7 @@ log_message() {
 }
 
 log_message "**********************************************************"
+log_message "Network Diagnostics Script Version: $SCRIPT_VERSION"
 log_message "Log file initialized at $LOG_FILE"
 log_message "Logging all diagnostics to $LOG_FILE"
 log_message "**********************************************************"
@@ -107,7 +110,7 @@ install_tools() {
             PKG_MANAGER="apt-get"
             UPDATE_CMD="apt-get update"
             INSTALL_CMD="apt-get install -y"
-            packages_to_install="nmap netcat-openbsd tcpdump dnsutils iproute2 iftop net-tools iptraf-ng nethogs nload curl wget lsof tshark"
+            packages_to_install="nmap bc netcat-openbsd tcpdump dnsutils iproute2 iftop net-tools iptraf-ng nethogs nload curl wget lsof tshark"
             ;;
         rhel|mariner|azurelinux) # Red Hat, CBL-Mariner, Azure Linux
             PKG_MANAGER="dnf"
@@ -117,13 +120,13 @@ install_tools() {
             UPDATE_CMD="$PKG_MANAGER makecache"
             INSTALL_CMD="$PKG_MANAGER install -y"
             # nmap-ncat provides 'nc', bind-utils provides 'nslookup'
-            packages_to_install="nmap nmap-ncat tcpdump iproute bind-utils iftop net-tools iptraf-ng nethogs curl wget lsof tshark"
+            packages_to_install="nmap bc nmap-ncat tcpdump iproute bind-utils iftop net-tools iptraf-ng nethogs curl wget lsof tshark"
             ;;
         alpine)
             PKG_MANAGER="apk"
             UPDATE_CMD="apk update"
             INSTALL_CMD="apk add"
-            packages_to_install="nmap nmap-ncat tcpdump iproute2 bind-tools iftop net-tools iptraf-ng nethogs nload curl wget lsof tshark"
+            packages_to_install="nmap bc nmap-ncat tcpdump iproute2 bind-tools iftop net-tools iptraf-ng nethogs nload curl wget lsof tshark"
             ;;
         *)
             log_message "Unsupported Operating System: $OS_ID. Cannot install tools."
@@ -170,6 +173,73 @@ check_tools() {
     fi
 }
 
+dns_lookup() {
+    local target_ip="$1"
+    if [[ "$target_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_message "  [dns] Reverse lookup (IP → name)"
+
+        if out=$(dig +short -x "$target_ip" 2>/dev/null); then
+            if [ -n "$out" ]; then
+                echo "$out" | sed 's/^/  [dns] /' | tee -a "$LOG_FILE"
+                return
+            fi
+        fi
+
+        if out=$(nslookup "$target_ip" 2>/dev/null); then
+            echo "$out" | sed 's/^/  [dns] /' | tee -a "$LOG_FILE"
+        else
+            log_message "  [dns] No PTR record found (normal for many IPs)"
+        fi
+
+    else
+        log_message "  [dns] Forward lookup (name → IP)"
+
+        if out=$(dig +short "$target_ip" 2>/dev/null); then
+            if [ -n "$out" ]; then
+                echo "$out" | sed 's/^/  [dns] /' | tee -a "$LOG_FILE"
+                return
+            fi
+        fi
+
+        if out=$(nslookup "$target_ip" 2>/dev/null); then
+            echo "$out" | sed 's/^/  [dns] /' | tee -a "$LOG_FILE"
+        else
+            log_message "  [dns] Forward lookup failed"
+        fi
+    fi
+}
+
+run_nping() {
+    local target_ip="$1"
+    local target_port="$2"
+
+    if ! command -v nping >/dev/null 2>&1; then
+        log_message "  [nping] not installed on this system"
+        return
+    fi
+
+    local output
+    output=$(nping --tcp-connect -p "$target_port" -c 5 "$target_ip" 2>&1)
+    
+    echo "$output" | awk -v log_file="$LOG_FILE" '
+    /Max rtt:/ { 
+        print "  [nping]", $0 > log_file
+        max_rtt=$3; min_rtt=$6; avg_rtt=$9
+    }
+    /TCP connection attempts:/ {
+        print "  [nping]", $0 > log_file
+        success=$7+0
+        fail=$10+0
+        if (success>0) {
+            print "  [nping] Connectivity SUCCESS: " success " of " ($7+$10) " connections worked" > log_file
+        } else {
+            print "  [nping] Connectivity FAILED: All attempts failed" > log_file
+        }
+    }'
+    echo "$output" | awk -v log_file="$LOG_FILE" '/SENT|RCVD/ {print "  [nping]", $0 > log_file}'
+}
+
+
 # n/w diagnostics helper function
 run_diagnostics() {
     local target_ip="$1"
@@ -180,10 +250,7 @@ run_diagnostics() {
     # --- 1. DNS resolution ---
     log_message ""
     log_message "DNS lookup (nslookup)"
-    if ! nslookup "$target_ip" 2>&1 | sed 's/^/  [dns] /' | tee -a "$LOG_FILE"; then
-        log_message "  [dns] did not succeed or try manually if reverse lookup"
-    fi
-    wait
+    dns_lookup "$target_ip"
     log_message "----------------------------------------------------------"
 
     # --- 2. Network Reachability: nc ---
@@ -196,25 +263,12 @@ run_diagnostics() {
         log_message "  [nc] Upstream dst NOT reachable. Validate port and IP, try a different destination or a public endpoint and with a different (installed) tool (tcpping, nping)"
         nc_rc=1
     fi
-    wait
     log_message "----------------------------------------------------------"
 
     # --- 3. Network Connectivity + latency: nping ---
     log_message ""
     log_message " \\n Connectivity & latency test (nping --tcp-connect)"
-    if ! command -v nping >/dev/null 2>&1; then
-        log_message "  [nping] not available on this system"
-    else
-        output="$(nping --tcp-connect -p "$target_port" -c 5 "$target_ip" 2>&1)"
-
-        if echo "$output" | grep -iq "succeeded"; then
-            echo "$output" | awk '/RTT/ {print "  [nping]", $0}' | tee -a "$LOG_FILE"
-        else
-            log_message "  [nping] Connection attempt failed"
-            echo "$output" | sed 's/^/  [nping] /' | tee -a "$LOG_FILE"
-        fi
-    fi
-    wait
+    run_nping "$target_ip" "$target_port"
     log_message "----------------------------------------------------------"
 
     # --- 4. Packet capture (120s) - pcap + live diagnostics ---
@@ -224,72 +278,121 @@ run_diagnostics() {
     local pcap_file="$PACKET_CAPTURE_FILE"
     local filter="(host $target_ip and port $target_port) or port 53"
 
-    local tcpdump_cmd_all="tcpdump -i any -tttt -nn -w \"$pcap_file\""
-    local tcpdump_cmd="tcpdump -i any -tttt -nn -w \"$pcap_file\" \"$filter\""
-    local tcpdump_live="tcpdump -i any -tttt -nn \"$filter\" | egrep 'Flags|retransmission|Retransmission|Dup ACK|RST|NXDOMAIN|ServFail|timeout'"
+    local tcpdump_cmd="tcpdump -i any -tttt -nn -U -w \"$pcap_file\""
+    # local tcpdump_live="tcpdump -i any -tttt -U -nn \"$filter\" | egrep 'Flags|retransmission|Retransmission|Dup ACK|RST|NXDOMAIN|ServFail|timeout'"
 
     if [ "$EUID" -ne 0 ]; then
         log_message "Using sudo for tcpdump"
-        sudo timeout 120 tcpdump -i any -tttt -nn "$filter" | sed 's/^/  [tcpdump] /' | tee -a "$LOG_FILE" &
-        sudo timeout 120 tcpdump -i any -tttt -nn -w "$pcap_file" "$filter" >/dev/null 2>&1
+        sudo timeout 120 bash -c "$tcpdump_cmd" >/dev/null 2>&1
     else
-        timeout 120 tcpdump -i any -tttt -nn "$filter" | sed 's/^/  [tcpdump] /' | tee -a "$LOG_FILE" &
-        timeout 120 tcpdump -i any -tttt -nn -w "$pcap_file" "$filter" >/dev/null 2>&1
+        timeout 120 bash -c "$tcpdump_cmd" >/dev/null 2>&1
     fi
-
-    wait
     log_message "Packet capture saved to $pcap_file"
     log_message "----------------------------------------------------------"
 
 # --- 5. TCP Stream Summary using tshark ---
-if command -v tshark >/dev/null 2>&1; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
     log_message ""
-    log_message "Generating TCP stream summary (SYN, SYN-ACK, retransmissions, RTT, SYN_DROP)..."
+    log_message "TCP Analysis summary for $target_ip:$target_port"
+    log_message "
+    LEGEND (TCP Flags String: [C E U A P R S F])
+    --------------------------------------------
+    C = CWR (Congestion Window Reduced)
+    E = ECE (ECN-Echo)
+    U = URG (Urgent)
+    A = ACK (Acknowledgment)
+    P = PSH (Push)
+    R = RST (Reset)
+    S = SYN (Synchronize)
+    F = FIN (Finish)
+    * = Flag not set
+    --------------------------------------------"
 
-    # Ensure tshark can parse TCP
-    tshark -r "$pcap_file" -q -z conv,tcp >/dev/null 2>&1
+# Apply display filter to analyze only target TCP + DNS packets
+    tshark -r "$pcap_file" -Y "(tcp.port == $target_port && ip.addr == $target_ip) || (dns)" -T fields \
+    -e tcp.stream \
+    -e frame.time_relative \
+    -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport \
+    -e tcp.flags.str -e tcp.seq -e tcp.ack \
+    -e tcp.len \
+    -e tcp.analysis.ack_rtt \
+    -e tcp.analysis.retransmission \
+    -e tcp.analysis.lost_segment \
+    -E header=y -E separator=/t | awk -F'\t' '
+BEGIN {
+    current_stream = -1;
+}
+{
+    if ($1 == "tcp.stream") next;
 
-    # Get all TCP streams
-    STREAMS=$(tshark -r "$pcap_file" -T fields -e tcp.stream | sort -n | uniq)
-    for stream in $STREAMS; do
-        echo "stream $stream:" | tee -a "$LOG_FILE"
+    stream = $1; time = $2; src = $3 ":" $4; dst = $5 ":" $6;
+    flags = $7; seq = $8; ack = $9; bytes = $10; rtt = $11; retrans = $12; lost = $13;
 
-        # Print each packet in the stream
-        tshark -r "$pcap_file" -Y "tcp.stream==$stream" -T fields \
-            -e frame.time_relative \
-            -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport \
-            -e tcp.flags -e tcp.seq -e tcp.ack -e tcp.analysis.retransmission \
-        | while read -r time src sport dst dport flags seq ack retrans; do
-            FLAG_STR=""
-            [[ $flags =~ 0x02 ]] && FLAG_STR+="SYN "
-            [[ $flags =~ 0x12 ]] && FLAG_STR+="SYN-ACK "
-            [[ $flags =~ 0x10 ]] && FLAG_STR+="ACK "
-            [[ $flags =~ 0x04 ]] && FLAG_STR+="RST "
-            [[ -n $retrans ]] && FLAG_STR+="# retransmission"
-            echo "  $src:$sport -> $dst:$dport $FLAG_STR seq=$seq ack=$ack time=${time}s" | tee -a "$LOG_FILE"
-        done
+    # Initialize per-stream stats
+    if (!(stream in stream_bytes_sent)) {
+        stream_bytes_sent[stream] = 0;
+        stream_bytes_recv[stream] = 0;
+        stream_retrans[stream] = 0;
+        stream_syn_sent[stream] = 0;
+        stream_synack_received[stream] = 0;
+        stream_start_time[stream] = time;
+        stream_end_time[stream] = time;
+        stream_push_detected[stream] = 0;
+    }
 
-        # Calculate SYN → SYN-ACK RTT
-        SYN_TIME=$(tshark -r "$pcap_file" -Y "tcp.stream==$stream and tcp.flags.syn==1 and tcp.flags.ack==0" -T fields -e frame.time_relative | head -1)
-        SYNACK_TIME=$(tshark -r "$pcap_file" -Y "tcp.stream==$stream and tcp.flags.syn==1 and tcp.flags.ack==1" -T fields -e frame.time_relative | head -1)
+    # Update direction-based bytes
+    if (src ~ "'"$target_ip"'") {
+        stream_bytes_sent[stream] += bytes;
+    } else {
+        stream_bytes_recv[stream] += bytes;
+    }
 
-        if [[ -z $SYNACK_TIME && -n $SYN_TIME ]]; then
-            echo "  # no reply → SYN_DROP" | tee -a "$LOG_FILE"
-        elif [[ -n $SYN_TIME && -n $SYNACK_TIME ]]; then
-            RTT=$(echo "($SYNACK_TIME - $SYN_TIME)*1000" | bc -l)
-            printf "  # SYN → SYN-ACK RTT: %.2f ms\n" "$RTT" | tee -a "$LOG_FILE"
-        fi
+    # Track retransmissions
+    if (retrans != "") stream_retrans[stream]++;
 
-        echo "" | tee -a "$LOG_FILE"
-    done
-else
-    log_message "tshark not available. Skipping TCP stream summary. Review pcap with tcpdump or Wireshark."
-fi
+    # Detect push
+    if (flags ~ /P/) stream_push_detected[stream] = 1;
 
+    # Track SYN/SYN-ACK
+    if (flags ~ /S/ && flags !~ /A/) stream_syn_sent[stream]++;
+    if (flags ~ /S/ && flags ~ /A/) stream_synack_received[stream]++;
+
+    # Update connection end time
+    stream_end_time[stream] = time;
+
+    # Print per-packet details
+    if (stream != current_stream) {
+        if (current_stream != -1) print "\n----------------------------------------------------------";
+        print "\n[ STREAM ID: " stream " ]";
+        printf "%-10s | %-28s | %-10s | %-8s | %-8s | %-5s | %-8s | %-8s | %-8s\n", "Time", "Src -> Dst", "Flags", "Seq", "Ack", "Bytes", "RTT(ms)", "Push", "Retrans";
+        print "----------------------------------------------------------------------------------------------------";
+        current_stream = stream;
+    }
+
+    rtt_disp = (rtt != "" ? sprintf("%.2f", rtt * 1000) : "-");
+    push_flag = (stream_push_detected[stream] ? "YES" : "NO");
+    retrans_flag = (retrans != "" ? "YES" : "NO");
+
+    printf "%-10.4f | %-28s | %-10s | %-8s | %-8s | %-5s | %-8s | %-8s | %-8s\n", time, src " -> " dst, flags, seq, ack, bytes, rtt_disp, push_flag, retrans_flag;
+}
+END {
+    print "\n============================================================";
+    print "FINAL STREAM SUMMARY";
+    print "============================================================";
+
+    for (s in stream_bytes_sent) {
+        duration = stream_end_time[s] - stream_start_time[s];
+        syn_drops = stream_syn_sent[s] - stream_synack_received[s];
+        retrans_pct = (stream_retrans[s] > 0 ? sprintf("%.2f", (stream_retrans[s]/(stream_retrans[s]+1))*100) : "0.00");
+
+        printf "[Stream %s] Duration: %.3fs | Bytes Sent: %d | Bytes Recv: %d | Retrans: %d (%s%%) | SYN drops: %d | Push detected: %s\n",
+            s, duration, stream_bytes_sent[s], stream_bytes_recv[s], stream_retrans[s], retrans_pct, syn_drops, (stream_push_detected[s] ? "YES" : "NO");
+    }
+    print "============================================================";
+}'
     log_message "----------------------------------------------------------"
     log_message "Diagnostics finished for $target_ip:$target_port"
 }
-
 
 # Tests connectivity to a target on specified ports.
 # Usage: test_connectivity "target.com" "80" "443"
@@ -381,6 +484,10 @@ show_help() {
     echo "Packet Captures: $PACKET_CAPTURE_FILE (for 'run' mode)"
 }
 
+# Show script version
+show_version() {
+    echo "Network Diagnostics Script - Version $SCRIPT_VERSION"
+}
 
 # ==============================================================================
 # MAIN SCRIPT
@@ -409,6 +516,10 @@ case "$1" in
         ;;
     -h|--help)
         show_help
+        exit 0
+        ;;
+    -v|--version)
+        show_version
         exit 0
         ;;
 esac
