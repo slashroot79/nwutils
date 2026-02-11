@@ -22,7 +22,7 @@ List of tools: nmap netcat-openbsd tcpdump dnsutils iproute2 iftop net-tools ipt
 
 - **nwutils install :** Detects OS type and level and install tools
 - **nwutils run :** Runs in interactive mode and prompts for destination port number and proceeds with all diagnostics and generates logs and trace files.  
-- **nwutils <FQDN> and optionally <port> :** Similar to interactive mode but for the specified destination IP and Port. 
+- **nwutils FQDN and optionally PORT :** Similar to interactive mode but for the specified destination IP and Port. 
 - **nwutil help or no args :** Help and more options
 ---
 

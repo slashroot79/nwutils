@@ -85,7 +85,7 @@ validate_host() {
 # Detects OS and installs networking tools
 install_tools() {
     root_or_try install
-    log_message "*** Starting Tool Installation ***"
+    log_message "*** Beginning installation of tools ***"
     log_message "**********************************************************"
 
     # Detect OS
@@ -145,7 +145,7 @@ install_tools() {
             log_message "Skip install for $pkg: Package not found or failed to install."
         fi
     done
-    log_message "*** Tool Installation Complete ***"
+    log_message "*** Installation Complete ***"
     log_message "**********************************************************"
 }
 
@@ -212,40 +212,48 @@ dns_lookup() {
 run_nping() {
     local target_ip="$1"
     local target_port="$2"
-
     if ! command -v nping >/dev/null 2>&1; then
         log_message "  [nping] not installed on this system"
         return
     fi
-
-    local output
-    output=$(nping --tcp-connect -p "$target_port" -c 5 "$target_ip" 2>&1)
+    # Execute nping and process everything in a single awk stream
+    nping --tcp-connect -p "$target_port" -c 5 "$target_ip" 2>&1 | awk '
+    /SENT|RCVD/ { print "  [nping] " $0 }
+    /Max rtt:/ { print "  [nping] Stats: " $0 }
     
-    echo "$output" | awk -v log_file="$LOG_FILE" '
-    /Max rtt:/ { 
-        print "  [nping]", $0 > log_file
-        max_rtt=$3; min_rtt=$6; avg_rtt=$9
-    }
+    # Improved parsing: look specifically for the integers in the summary line
     /TCP connection attempts:/ {
-        print "  [nping]", $0 > log_file
-        success=$7+0
-        fail=$10+0
-        if (success>0) {
-            print "  [nping] Connectivity SUCCESS: " success " of " ($7+$10) " connections worked" > log_file
-        } else {
-            print "  [nping] Connectivity FAILED: All attempts failed" > log_file
-        }
-    }'
-    echo "$output" | awk -v log_file="$LOG_FILE" '/SENT|RCVD/ {print "  [nping]", $0 > log_file}'
-}
+        # Extract numbers using match or field position
+        # "TCP connection attempts: 5 | Successful connections: 5 | Failed: 0 (0.00%)"
+        split($0, parts, "|");
+        
+        # Parse Successful count from the second part
+        split(parts[2], success_part, ":");
+        success = success_part[2] + 0;
+        
+        # Parse Failed count from the third part
+        split(parts[3], fail_part, ":");
+        fail = fail_part[2] + 0;
+        
+        total = success + fail;
 
+        print "  [nping] Summary: " $0
+        
+        if (success > 0) {
+            printf "  [nping] Result: SUCCESS (%d/%d connections worked)\n", success, total
+        } else {
+            printf "  [nping] Result: FAILED (All %d attempts failed)\n", total
+        }
+    }' | tee -a "$LOG_FILE"
+    log_message "[nping] Test complete."
+}
 
 # n/w diagnostics helper function
 run_diagnostics() {
     local target_ip="$1"
     local target_port="$2"
 
-    log_message "Proceeding with diagnostics for $target_ip:$target_port..."
+    log_message "Starting..."
 
     # --- 1. DNS resolution ---
     log_message ""
@@ -256,12 +264,15 @@ run_diagnostics() {
     # --- 2. Network Reachability: nc ---
     log_message ""
     log_message "Reachability test (nc)"
-    if nc -z -w 3 "$target_ip" "$target_port" >/dev/null 2>&1; then
-        log_message "  [nc] Success...destination is reachable"
-        nc_rc=0
+    nc_output=$(nc -zv -w 3 "$target_ip" "$target_port" 2>&1)
+    nc_rc=$?
+    if [ $nc_rc -eq 0 ]; then
+        log_message "  [nc] Success: Destination is reachable."
+        echo "Detailed nc output: $nc_output" >> "$LOG_FILE" //log only to file
     else
-        log_message "  [nc] Upstream dst NOT reachable. Validate port and IP, try a different destination or a public endpoint and with a different (installed) tool (tcpping, nping)"
-        nc_rc=1
+        log_message "  [nc] Error: Destination NOT reachable."
+        log_message "  [nc] Diagnostic Details: $nc_output"
+        log_message "  [nc] Action: Validate Port/IP, attempt different IP/Port, check NSGs/Firewalls, or collect tcpdump."
     fi
     log_message "----------------------------------------------------------"
 
@@ -291,105 +302,98 @@ run_diagnostics() {
     log_message "----------------------------------------------------------"
 
 # --- 5. TCP Stream Summary using tshark ---
-    exec > >(tee -a "$LOG_FILE") 2>&1
     log_message ""
-    log_message "TCP Analysis summary for $target_ip:$target_port"
-    log_message "
-    LEGEND (TCP Flags String: [C E U A P R S F])
-    --------------------------------------------
-    C = CWR (Congestion Window Reduced)
-    E = ECE (ECN-Echo)
-    U = URG (Urgent)
-    A = ACK (Acknowledgment)
-    P = PSH (Push)
-    R = RST (Reset)
-    S = SYN (Synchronize)
-    F = FIN (Finish)
-    * = Flag not set
-    --------------------------------------------"
+    if [ ! -s "$pcap_file" ]; then
+        log_message "Error: Pcap file is empty. Capture failed or no packets found."
+        return
+    fi
+    log_message "Analyzing traffic for $target_ip:$target_port..."
+    echo "Legend: [S]=SYN [A]=ACK [P]=PSH [F]=FIN [R]=RST | Delta = Time since prev packet" | tee -a "$LOG_FILE"
+    echo "" | tee -a "$LOG_FILE"
+
 
 # Apply display filter to analyze only target TCP + DNS packets
-    tshark -r "$pcap_file" -Y "(tcp.port == $target_port && ip.addr == $target_ip) || (dns)" -T fields \
-    -e tcp.stream \
-    -e frame.time_relative \
-    -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport \
-    -e tcp.flags.str -e tcp.seq -e tcp.ack \
-    -e tcp.len \
-    -e tcp.analysis.ack_rtt \
-    -e tcp.analysis.retransmission \
-    -e tcp.analysis.lost_segment \
-    -E header=y -E separator=/t | awk -F'\t' '
-BEGIN {
-    current_stream = -1;
-}
-{
-    if ($1 == "tcp.stream") next;
-
-    stream = $1; time = $2; src = $3 ":" $4; dst = $5 ":" $6;
-    flags = $7; seq = $8; ack = $9; bytes = $10; rtt = $11; retrans = $12; lost = $13;
-
-    # Initialize per-stream stats
-    if (!(stream in stream_bytes_sent)) {
-        stream_bytes_sent[stream] = 0;
-        stream_bytes_recv[stream] = 0;
-        stream_retrans[stream] = 0;
-        stream_syn_sent[stream] = 0;
-        stream_synack_received[stream] = 0;
-        stream_start_time[stream] = time;
-        stream_end_time[stream] = time;
-        stream_push_detected[stream] = 0;
+    tshark -r "$pcap_file" \
+        -Y "(tcp.port == $target_port && ip.addr == $target_ip) || (dns)" \
+        -T fields \
+        -e tcp.stream \
+        -e frame.time_relative \
+        -e frame.interface_name \
+        -e ip.src -e tcp.srcport \
+        -e ip.dst -e tcp.dstport \
+        -e tcp.flags.str \
+        -e tcp.seq -e tcp.ack \
+        -e tcp.len \
+        -e tcp.analysis.ack_rtt \
+        -e tcp.analysis.retransmission \
+        -e frame.time_delta \
+        -E header=y -E separator=/t -E quote=d | \
+    awk -F'\t' -v target_ip="$target_ip" '
+    BEGIN {
+        # Define a clean, fixed-width format string for the table
+        # Time | IFace | Source:Port -> Dest:Port | Flags | Seq | Ack | PktLen | RTT | Retrans | Delta
+        fmt = "%-10s | %-8s | %-42s | %-8s | %-10s | %-10s | %-6s | %-8s | %-7s | %-8s\n";
+        
+        # Table Header
+        header_line = "----------------------------------------------------------------------------------------------------------------------------------------------------------";
+        print header_line;
+        printf fmt, "Time(s)", "IFace", "Source:Port -> Dest:Port", "Flags", "Seq", "Ack", "Bytes", "RTT(ms)", "Retrans", "Delta(s)";
+        print header_line;
+        
+        current_stream = -1;
     }
+    {
+        # 1. Skip tshark header line
+        if ($1 == "tcp.stream") next;
 
-    # Update direction-based bytes
-    if (src ~ "'"$target_ip"'") {
-        stream_bytes_sent[stream] += bytes;
-    } else {
-        stream_bytes_recv[stream] += bytes;
+        # 2. Cleanup: Remove quotes from all fields provided by tshark -E 
+        gsub(/"/, "", $0);
+
+        # 3. Assign variables from tshark fields
+        stream=$1; 
+        time=sprintf("%.4f",$2); 
+        iface=($3 != "" ? $3 : "any");  # Default to "any" if interface name is missing
+        src=$4; sport=$5; dst=$6; dport=$7;
+        flags=$8; seq=$9; ack=$10; len=$11; 
+        rtt=$12; retrans=$13; delta=sprintf("%.4f",$14);
+
+        # 4. Stream Separation: Print a header whenever a new TCP stream is detected
+        if (stream != current_stream) {
+            if (current_stream != -1) print "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -";
+            printf " [ TCP STREAM ID: %s ]\n", stream;
+            current_stream = stream;
+        }
+
+        # 5. Format Direction String
+        direction = src ":" sport " -> " dst ":" dport;
+
+        # 6. Simplify TCP Flags: Converts "....A..." to "[A]" or "....S.A." to "[SA]"
+        pretty_flags = "["
+        if (flags ~ /S/) pretty_flags = pretty_flags "S"
+        if (flags ~ /A/) pretty_flags = pretty_flags "A"
+        if (flags ~ /P/) pretty_flags = pretty_flags "P"
+        if (flags ~ /R/) pretty_flags = pretty_flags "R"
+        if (flags ~ /F/) pretty_flags = pretty_flags "F"
+        pretty_flags = pretty_flags "]"
+        if (pretty_flags == "[]") pretty_flags = "[.]"; 
+
+        # 7. Format RTT: Convert seconds to milliseconds, handle empty values
+        rtt_val = (rtt != "" ? sprintf("%.2f", rtt * 1000) : "-");
+
+        # 8. Handle Retransmission Logic
+        if (retrans != "") {
+            is_retrans = "YES";
+            time = time " *"; # Append asterisk to time for easy visual scanning of loss
+        } else {
+            is_retrans = "NO";
+        }
+
+        # 9. Final Output to screen and log (via tee)
+        printf fmt, time, iface, direction, pretty_flags, seq, ack, len, rtt_val, is_retrans, delta;
     }
-
-    # Track retransmissions
-    if (retrans != "") stream_retrans[stream]++;
-
-    # Detect push
-    if (flags ~ /P/) stream_push_detected[stream] = 1;
-
-    # Track SYN/SYN-ACK
-    if (flags ~ /S/ && flags !~ /A/) stream_syn_sent[stream]++;
-    if (flags ~ /S/ && flags ~ /A/) stream_synack_received[stream]++;
-
-    # Update connection end time
-    stream_end_time[stream] = time;
-
-    # Print per-packet details
-    if (stream != current_stream) {
-        if (current_stream != -1) print "\n----------------------------------------------------------";
-        print "\n[ STREAM ID: " stream " ]";
-        printf "%-10s | %-28s | %-10s | %-8s | %-8s | %-5s | %-8s | %-8s | %-8s\n", "Time", "Src -> Dst", "Flags", "Seq", "Ack", "Bytes", "RTT(ms)", "Push", "Retrans";
-        print "----------------------------------------------------------------------------------------------------";
-        current_stream = stream;
-    }
-
-    rtt_disp = (rtt != "" ? sprintf("%.2f", rtt * 1000) : "-");
-    push_flag = (stream_push_detected[stream] ? "YES" : "NO");
-    retrans_flag = (retrans != "" ? "YES" : "NO");
-
-    printf "%-10.4f | %-28s | %-10s | %-8s | %-8s | %-5s | %-8s | %-8s | %-8s\n", time, src " -> " dst, flags, seq, ack, bytes, rtt_disp, push_flag, retrans_flag;
-}
-END {
-    print "\n============================================================";
-    print "FINAL STREAM SUMMARY";
-    print "============================================================";
-
-    for (s in stream_bytes_sent) {
-        duration = stream_end_time[s] - stream_start_time[s];
-        syn_drops = stream_syn_sent[s] - stream_synack_received[s];
-        retrans_pct = (stream_retrans[s] > 0 ? sprintf("%.2f", (stream_retrans[s]/(stream_retrans[s]+1))*100) : "0.00");
-
-        printf "[Stream %s] Duration: %.3fs | Bytes Sent: %d | Bytes Recv: %d | Retrans: %d (%s%%) | SYN drops: %d | Push detected: %s\n",
-            s, duration, stream_bytes_sent[s], stream_bytes_recv[s], stream_retrans[s], retrans_pct, syn_drops, (stream_push_detected[s] ? "YES" : "NO");
-    }
-    print "============================================================";
-}'
+    END {
+        print header_line;
+    }' | tee -a "$LOG_FILE"
     log_message "----------------------------------------------------------"
     log_message "Diagnostics finished for $target_ip:$target_port"
 }
@@ -415,7 +419,7 @@ test_connectivity() {
 
 # RUN 
 run_interactive() {
-    log_message "*** Starting tests in Interactive Mode ***"
+    log_message "*** Beginning tests in Interactive Mode ***"
     log_message "**********************************************************"
     check_tools "nmap" "iftop" "netstat"
 
