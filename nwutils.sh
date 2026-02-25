@@ -119,8 +119,11 @@ install_tools() {
             fi
             UPDATE_CMD="$PKG_MANAGER makecache"
             INSTALL_CMD="$PKG_MANAGER install -y"
-            # nmap-ncat provides 'nc', bind-utils provides 'nslookup'
-            packages_to_install="nmap bc nmap-ncat tcpdump iproute bind-utils iftop net-tools iptraf-ng nethogs curl wget lsof tshark"
+            # nmap-ncat provides 'nc', bind-utils provides 'nslookup'.
+            # NOTE: iftop, iptraf-ng, nethogs are not in standard Mariner/Azure Linux repos — omitted.
+            # tshark is handled separately below: try 'tshark' package first, fall back to 'wireshark'
+            # (the wireshark package bundles the tshark binary on Mariner/Azure Linux).
+            packages_to_install="nmap bc nmap-ncat tcpdump iproute bind-utils net-tools curl wget lsof"
             ;;
         alpine)
             PKG_MANAGER="apk"
@@ -145,6 +148,27 @@ install_tools() {
             log_message "Skip install for $pkg: Package not found or failed to install."
         fi
     done
+
+    # tshark special handling:
+    # On Mariner/Azure Linux the standalone 'tshark' package may not exist;
+    # the 'wireshark' package ships the tshark binary instead.
+    # On other distros 'tshark' is the correct package name — try it first.
+    if ! command -v tshark &>/dev/null; then
+        log_message "tshark not found after install attempt — trying 'tshark' package..."
+        if $INSTALL_CMD tshark >/dev/null 2>&1 && command -v tshark &>/dev/null; then
+            log_message "Successfully installed tshark."
+        else
+            log_message "'tshark' package not available — trying 'wireshark' as fallback..."
+            if $INSTALL_CMD wireshark >/dev/null 2>&1 && command -v tshark &>/dev/null; then
+                log_message "Successfully installed tshark via wireshark package."
+            else
+                log_message "WARNING: tshark could not be installed. Packet analysis (step 5b/5c) will be skipped."
+            fi
+        fi
+    else
+        log_message "tshark is already available."
+    fi
+
     log_message "*** Installation Complete ***"
     log_message "**********************************************************"
 }
